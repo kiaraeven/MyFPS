@@ -1,0 +1,21 @@
+# 编译生成的临时文件
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+
+# Visual Studio / Rider 生成的工程文件
+.vs/
+.idea/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+
+# macOS 垃圾文件
+.DS_Store
+
+# 部分插件的临时文件
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
