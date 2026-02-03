@@ -150,7 +150,13 @@ void AMyCharacter::PlayReloadMontage()
 		FName SectionName;
 		switch (CombatComponent->EquippedWeapon->GetWeaponType())
 		{
-		case EWeaponType::EWT_ProjectileWeapon:
+		case EWeaponType::EWT_AssaultRifle:
+			SectionName = FName("Rifle");
+			break;
+		case EWeaponType::EWT_RocketLauncher:
+			SectionName = FName("Rifle");
+			break;
+		case EWeaponType::EWT_Pistol:
 			SectionName = FName("Rifle");
 			break;
 		}
@@ -192,6 +198,7 @@ void AMyCharacter::Destroyed()
 		CombatComponent->EquippedWeapon->Destroy();
 	}
 }
+
 
 void AMyCharacter::MulticastElim_Implementation()
 {
@@ -238,6 +245,17 @@ void AMyCharacter::MulticastElim_Implementation()
 	// Disable collision
 	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	GetMesh()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// Hide sniper scope
+	bool bHideSniperScope = IsLocallyControlled() &&
+		CombatComponent &&
+		CombatComponent->bAiming &&
+		CombatComponent->EquippedWeapon &&
+		CombatComponent->EquippedWeapon->GetWeaponType() == EWeaponType::EWT_AssaultRifle;
+	if (bHideSniperScope)
+	{
+		ShowSniperScopeWidget(false);
+	}
 }
 
 void AMyCharacter::PlayHitReactMontage()
