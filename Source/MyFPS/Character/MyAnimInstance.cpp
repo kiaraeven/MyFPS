@@ -6,6 +6,7 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "MyFPS/Weapon/Weapon.h"
+#include "MyFPS/MyTypes/CombatState.h"
 
 void UMyAnimInstance::NativeInitializeAnimation() {
 	Super::NativeBeginPlay();
@@ -65,5 +66,8 @@ void UMyAnimInstance::NativeUpdateAnimation(float DeltaSeconds) {
 				RightHandRotation = FMath::RInterpTo(RightHandRotation, LookAtRotation, DeltaSeconds, 30.f);
 			}
 		}
+		bUseFABRIK = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading;
+		bUseAimOffsets = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading && !MyCharacter->GetDisableGameplay();
+		bTransformRightHand = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading && !MyCharacter->GetDisableGameplay();
 	}
 }

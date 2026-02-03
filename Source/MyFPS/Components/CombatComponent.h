@@ -6,6 +6,7 @@
 #include "Components/ActorComponent.h"
 #include "MyFPS/HUD/MyHUD.h"
 #include "MyFPS/Weapon/WeaponTypes.h"
+#include "MyFPS/MyTypes/CombatState.h"
 #include "CombatComponent.generated.h"
 
 
@@ -19,6 +20,10 @@ public:
 	friend class AMyCharacter;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	void EquipWeapon(class AWeapon* WeaponToEquip);
+	void Reload();
+	UFUNCTION(BlueprintCallable)
+	void FinishReloading();
+	void FireButtonPressed(bool bPressed);
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 protected:
@@ -28,7 +33,6 @@ protected:
 	void ServerSetAiming(bool bIsAiming);
 	UFUNCTION()
 	void OnRep_EquippedWeapon();
-	void FireButtonPressed(bool bPressed);
 	void Fire();
 	UFUNCTION(Server, Reliable)
 	void ServerFire(const FVector_NetQuantize& TraceHitTarget);
@@ -38,6 +42,11 @@ protected:
 	void TraceUnderCrosshairs(FHitResult& TraceHitResult);
 
 	void SetHUDCrosshairs(float DeltaTime);
+
+	UFUNCTION(Server, Reliable)
+	void ServerReload();
+	void HandleReload(); // Handle Everything happening on all machines
+	int32 AmountToReload(); 
 private:
 	UPROPERTY()
 	class AMyCharacter* Character;
@@ -104,6 +113,14 @@ private:
 	UPROPERTY(EditAnywhere)
 	int32 StartingARAmmo = 30;
 	void InitializeCarriedAmmo();
+
+	UPROPERTY(ReplicatedUsing = OnRep_CombatState)
+	ECombatState CombatState = ECombatState::ECS_Unoccupied;
+
+	UFUNCTION()
+	void OnRep_CombatState();
+
+	void UpdateAmmoValues();
 public:	
 	
 

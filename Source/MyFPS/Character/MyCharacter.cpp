@@ -15,7 +15,9 @@
 #include "MyFPS/PlayerController/MyPlayerController.h"
 #include "MyFPS/GameMode/MyGameMode.h"
 #include "TimerManager.h"
+#include "Kismet/GameplayStatics.h"
 #include "MyFPS/PlayerState/MyPlayerState.h"
+#include "MyFPS/Weapon/WeaponTypes.h"
 
 // Sets default values
 AMyCharacter::AMyCharacter()
@@ -101,6 +103,9 @@ void AMyCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 
 	PlayerInputComponent->BindAction("Fire", IE_Pressed, this, &AMyCharacter::FireButtonPressed);
 	PlayerInputComponent->BindAction("Fire", IE_Released, this, &AMyCharacter::FireButtonReleased);
+
+	PlayerInputComponent->BindAction("Reload", IE_Pressed, this, &AMyCharacter::ReloadButtonPressed);
+
 }
 
 void AMyCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -108,6 +113,7 @@ void AMyCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLife
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME_CONDITION(AMyCharacter, OverlappingWeapon, COND_OwnerOnly);
 	DOREPLIFETIME(AMyCharacter, Health);
+	DOREPLIFETIME(AMyCharacter, bDisableGameplay);
 }
 
 void AMyCharacter::PostInitializeComponents()
@@ -129,6 +135,25 @@ void AMyCharacter::PlayFireMontage(bool bAiming)
 		AnimInstance->Montage_Play(FireWeaponMontage);
 		FName SectionName;
 		SectionName = bAiming ? FName("RifleAim") : FName("RifleHip");
+		AnimInstance->Montage_JumpToSection(SectionName);
+	}
+}
+
+void AMyCharacter::PlayReloadMontage()
+{
+	if (CombatComponent == nullptr || CombatComponent->EquippedWeapon == nullptr) return;
+
+	UAnimInstance* AnimInstance = GetMesh()->GetAnimInstance();
+	if (AnimInstance && ReloadWeaponMontage)
+	{
+		AnimInstance->Montage_Play(ReloadWeaponMontage);
+		FName SectionName;
+		switch (CombatComponent->EquippedWeapon->GetWeaponType())
+		{
+		case EWeaponType::EWT_ProjectileWeapon:
+			SectionName = FName("Rifle");
+			break;
+		}
 		AnimInstance->Montage_JumpToSection(SectionName);
 	}
 }
@@ -155,6 +180,17 @@ void AMyCharacter::Elim()
 		&AMyCharacter::ElimTimerFinished,
 		ElimDelay
 	);
+}
+
+void AMyCharacter::Destroyed()
+{
+	Super::Destroyed();
+	AMyGameMode* MyGameMode = Cast<AMyGameMode>(UGameplayStatics::GetGameMode(this));
+	bool bMatchNotInProgress = MyGameMode && MyGameMode->GetMatchState() != MatchState::InProgress;
+	if (CombatComponent && CombatComponent->EquippedWeapon && bMatchNotInProgress)
+	{
+		CombatComponent->EquippedWeapon->Destroy();
+	}
 }
 
 void AMyCharacter::MulticastElim_Implementation()
@@ -190,6 +226,11 @@ void AMyCharacter::MulticastElim_Implementation()
 	// Disable character movement
 	GetCharacterMovement()->DisableMovement();
 	GetCharacterMovement()->StopMovementImmediately();
+	bDisableGameplay = true;
+	if (CombatComponent)
+	{
+		CombatComponent->FireButtonPressed(false);
+	}
 	if (MyPlayerController)
 	{
 		DisableInput(MyPlayerController);
@@ -254,6 +295,7 @@ void AMyCharacter::PollInit()
 
 
 void AMyCharacter::MoveForward(float Value) {
+	if (bDisableGameplay) return;
 	if (Controller != nullptr && Value != 0.0f) {
 		// Find out which way is forward
 		const FRotator Rotation = Controller->GetControlRotation();
@@ -265,6 +307,8 @@ void AMyCharacter::MoveForward(float Value) {
 }
 
 void AMyCharacter::MoveRight(float Value) {
+	if (bDisableGameplay) return;
+
 	if (Controller != nullptr && Value != 0.0f) {
 		// Find out which way is forward
 		const FRotator Rotation = Controller->GetControlRotation();
@@ -285,6 +329,8 @@ void AMyCharacter::Turn(float Value) {
 
 void AMyCharacter::EquipButtonPressed()
 {
+	if (bDisableGameplay) return;
+
 	if (CombatComponent)
 	{
 		if (HasAuthority()) {
@@ -300,14 +346,27 @@ void AMyCharacter::EquipButtonPressed()
 
 void AMyCharacter::CrouchButtonPressed()
 {
+	if (bDisableGameplay) return;
+
 	if (bIsCrouched)
 		UnCrouch();
 	else
 		Crouch();
 }
 
+void AMyCharacter::ReloadButtonPressed()
+{
+	if (bDisableGameplay) return;
+
+	if (CombatComponent) {
+		CombatComponent->Reload();
+	}
+}
+
 void AMyCharacter::AimButtonPressed()
 {
+	if (bDisableGameplay) return;
+
 	if (CombatComponent)
 	{
 		CombatComponent->SetAiming(true);
@@ -316,6 +375,8 @@ void AMyCharacter::AimButtonPressed()
 
 void AMyCharacter::AimButtonReleased()
 {
+	if (bDisableGameplay) return;
+
 	if (CombatComponent)
 	{
 		CombatComponent->SetAiming(false);
@@ -359,6 +420,7 @@ void AMyCharacter::AimOffset(float DeltaTime)
 
 void AMyCharacter::Jump()
 {
+	if (bDisableGameplay) return;
 	if (bIsCrouched)
 	{
 		UnCrouch();
@@ -371,6 +433,8 @@ void AMyCharacter::Jump()
 
 void AMyCharacter::FireButtonPressed()
 {
+	if (bDisableGameplay) return;
+
 	if (CombatComponent)
 	{
 		CombatComponent->FireButtonPressed(true);
@@ -379,6 +443,8 @@ void AMyCharacter::FireButtonPressed()
 
 void AMyCharacter::FireButtonReleased()
 {
+	if (bDisableGameplay) return;
+
 	if (CombatComponent)
 	{
 		CombatComponent->FireButtonPressed(false);
@@ -505,4 +571,10 @@ FVector AMyCharacter::GetHitTarget() const
 {
 	if (CombatComponent == nullptr) return FVector();
 	return CombatComponent->HitTarget;
+}
+
+ECombatState AMyCharacter::GetCombatState() const
+{
+	if (CombatComponent == nullptr) return ECombatState::ECS_MAX;
+	return CombatComponent->CombatState;
 }
