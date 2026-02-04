@@ -25,7 +25,7 @@ public:
 	void FinishReloading();
 	void FireButtonPressed(bool bPressed);
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
-
+	void PickupAmmo(EWeaponType WeaponType, int32 AmmoAmount);
 protected:
 	virtual void BeginPlay() override;
 	void SetAiming(bool bIsAiming);
@@ -47,6 +47,7 @@ protected:
 	void ServerReload();
 	void HandleReload(); // Handle Everything happening on all machines
 	int32 AmountToReload(); 
+	void UpdateCarriedAmmo();
 private:
 	UPROPERTY()
 	class AMyCharacter* Character;
@@ -109,7 +110,8 @@ private:
 	void OnRep_CarriedAmmo();
 
 	TMap<EWeaponType, int32> CarriedAmmoMap;
-
+	UPROPERTY(EditAnywhere)
+	int32 MaxCarriedAmmo = 500;
 	UPROPERTY(EditAnywhere)
 	int32 StartingARAmmo = 30;
 	UPROPERTY(EditAnywhere)

@@ -9,6 +9,7 @@
 #include "Net/UnrealNetwork.h"
 #include "MyFPS/Weapon/Weapon.h"
 #include "MyFPS/Components/CombatComponent.h"
+#include "MyFPS/Components/BuffComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "MyFPS/MyFPS.h"
@@ -45,6 +46,9 @@ AMyCharacter::AMyCharacter()
 	CombatComponent = CreateDefaultSubobject<UCombatComponent>(TEXT("CombatComponent"));
 	CombatComponent->SetIsReplicated(true);
 
+	Buff = CreateDefaultSubobject<UBuffComponent>(TEXT("BuffComponent"));
+	Buff->SetIsReplicated(true);
+
 	GetCharacterMovement()->NavAgentProps.bCanCrouch = true;
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore); // So camera does not collide with capsule
 	GetMesh()->SetCollisionObjectType(ECC_SkeletalMesh); // Custom channel so we can ignore in trace
@@ -67,7 +71,8 @@ void AMyCharacter::BeginPlay()
 	{
 		MyPlayerController->SetHUDHealth(Health, MaxHealth);
 	}
-
+	SpawnDefaultWeapon();
+	UpdateHUDAmmo();
 	UpdateHUDHealth();
 	if (HasAuthority())
 	{
@@ -123,6 +128,10 @@ void AMyCharacter::PostInitializeComponents()
 	{
 		CombatComponent->Character = this;
 	}
+	if (Buff)
+	{
+		Buff->Character = this;
+	}
 }
 
 void AMyCharacter::PlayFireMontage(bool bAiming)
@@ -177,7 +186,14 @@ void AMyCharacter::Elim()
 {
 	if (CombatComponent && CombatComponent->EquippedWeapon)
 	{
-		CombatComponent->EquippedWeapon->Dropped();
+		if (CombatComponent->EquippedWeapon->bDestroyWeapon)
+		{
+			CombatComponent->EquippedWeapon->Destroy();
+		}
+		else
+		{
+			CombatComponent->EquippedWeapon->Dropped();
+		}
 	}
 	MulticastElim();
 	GetWorldTimerManager().SetTimer(
@@ -296,6 +312,41 @@ void AMyCharacter::UpdateHUDHealth()
 	if (MyPlayerController)
 	{
 		MyPlayerController->SetHUDHealth(Health, MaxHealth);
+	}
+}
+
+void AMyCharacter::UpdateHUDAmmo()
+{
+	MyPlayerController = MyPlayerController == nullptr ? Cast<AMyPlayerController>(Controller) : MyPlayerController;
+	if (MyPlayerController && CombatComponent && CombatComponent->EquippedWeapon)
+	{
+		MyPlayerController->SetHUDCarriedAmmo(CombatComponent->CarriedAmmo);
+		MyPlayerController->SetHUDWeaponAmmo(CombatComponent->EquippedWeapon->GetAmmo());
+	}
+}
+
+void AMyCharacter::SpawnDefaultWeapon()
+{
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AMyGameMode* MyGameMode = Cast<AMyGameMode>(UGameplayStatics::GetGameMode(this));
+	UWorld* World = GetWorld();
+	if (MyGameMode && World && !bElimmed && DefaultWeaponClass)
+	{
+		//AWeapon* StartingWeapon = World->SpawnActor<AWeapon>(DefaultWeaponClass);
+		AWeapon* StartingWeapon = World->SpawnActor<AWeapon>(
+			DefaultWeaponClass,
+			GetActorTransform(),
+			SpawnParams
+		);
+		if (StartingWeapon)
+		{
+			StartingWeapon->bDestroyWeapon = true;
+			if (CombatComponent)
+			{
+				CombatComponent->EquipWeapon(StartingWeapon);
+			}
+		}
 	}
 }
 
@@ -522,10 +573,13 @@ void AMyCharacter::HideCameraIfCharacterClose()
 	}
 }
 
-void AMyCharacter::OnRep_Health()
+void AMyCharacter::OnRep_Health(float LastHealth)
 {
 	UpdateHUDHealth();
-	PlayHitReactMontage();
+	if (Health < LastHealth)
+	{
+		PlayHitReactMontage();
+	}
 }
 
 void AMyCharacter::ElimTimerFinished()

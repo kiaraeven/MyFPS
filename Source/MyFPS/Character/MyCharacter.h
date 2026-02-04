@@ -34,6 +34,9 @@ public:
 	bool bDisableGameplay = false;
 	UFUNCTION(BlueprintImplementableEvent)
 	void ShowSniperScopeWidget(bool bShowScope);
+	void UpdateHUDHealth();
+	void UpdateHUDAmmo();
+	void SpawnDefaultWeapon();
 protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
@@ -55,7 +58,6 @@ protected:
 	void PlayHitReactMontage();
 	UFUNCTION()
 	void ReceiveDamage(AActor* DamagedActor, float Damage, const UDamageType* DamageType, class AController* InstigatorController, AActor* DamageCauser); // callback for when character takes damage
-	void UpdateHUDHealth();
 	void PollInit(); // Poll for any relevant class and init HUD
 private:
 	UPROPERTY(VisibleAnywhere, Category = Camera, meta = (AllowPrivateAccess = "true"))
@@ -70,6 +72,8 @@ private:
 	void OnRep_OverlappingWeapon(AWeapon* LastWeapon);
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, meta = (AllowPrivateAccess = "true"))
 	class UCombatComponent* CombatComponent;
+	UPROPERTY(VisibleAnywhere)
+	class UBuffComponent* Buff;
 	UFUNCTION(Server, Reliable)
 	void ServerEquipButtonPressed(); // RPC for EquipButtonPressed
 
@@ -105,7 +109,7 @@ private:
 	UPROPERTY(ReplicatedUsing = OnRep_Health, VisibleAnywhere, Category = "Player Stats")
 	float Health = 100.f;
 	UFUNCTION()
-	void OnRep_Health();
+	void OnRep_Health(float LastHealth);
 	UPROPERTY()
 	class AMyPlayerController* MyPlayerController;
 	bool bElimmed = false;
@@ -147,6 +151,13 @@ private:
 	UMaterialInstance* DissolveMaterialInstanceTorso;
 	UPROPERTY()
 	class AMyPlayerState* MyPlayerState;
+
+	/**
+	* Default weapon
+	*/
+
+	UPROPERTY(EditAnywhere)
+	TSubclassOf<AWeapon> DefaultWeaponClass;
 public:	
 	void SetOverlappingWeapon(AWeapon* Weapon);
 	bool IsWeaponEquipped() const;
@@ -159,9 +170,10 @@ public:
 	FORCEINLINE UCameraComponent* GetFollowCamera() const { return FollowCamera; }
 	FORCEINLINE bool IsElimmed() const { return bElimmed; }
 	FORCEINLINE float GetHealth() const { return Health; }
+	FORCEINLINE void SetHealth(float Amount) { Health = Amount; }
 	FORCEINLINE float GetMaxHealth() const { return MaxHealth; }
 	ECombatState GetCombatState() const;
 	FORCEINLINE UCombatComponent* GetCombat() const { return CombatComponent; }
 	FORCEINLINE bool GetDisableGameplay() const { return bDisableGameplay; }
-
+	FORCEINLINE UBuffComponent* GetBuff() const { return Buff; }
 };
