@@ -12,8 +12,8 @@
 #include "MyFPS/HUD/Announcement.h"
 #include "Kismet/GameplayStatics.h"
 #include "MyFPS/Components/CombatComponent.h"
-#include "MyFPS/Weapon/Weapon.h"
 #include "MyFPS/GameState/MyGameState.h"
+#include "Components/Image.h"
 
 void AMyPlayerController::SetHUDHealth(float Health, float MaxHealth)
 {
@@ -149,6 +149,8 @@ void AMyPlayerController::Tick(float DeltaTime)
 	CheckTimeSync(DeltaTime);
 
 	PollInit();
+
+	CheckPing(DeltaTime);
 }
 
 void AMyPlayerController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -181,6 +183,7 @@ void AMyPlayerController::BeginPlay()
 	CharacterHUD = Cast<AMyHUD>(GetHUD());
 
 	ServerCheckMatchState();
+
 }
 
 void AMyPlayerController::SetHUDTime()
@@ -226,6 +229,85 @@ void AMyPlayerController::CheckTimeSync(float DeltaTime)
 	}
 }
 
+void AMyPlayerController::HighPingWarning()
+{
+	CharacterHUD = CharacterHUD == nullptr ? Cast<AMyHUD>(GetHUD()) : CharacterHUD;
+	bool bHUDValid = CharacterHUD &&
+		CharacterHUD->CharacterOverlay &&
+		CharacterHUD->CharacterOverlay->HighPingImage &&
+		CharacterHUD->CharacterOverlay->HighPingAnimation;
+	if (bHUDValid)
+	{
+		CharacterHUD->CharacterOverlay->HighPingImage->SetOpacity(1.f);
+		CharacterHUD->CharacterOverlay->PlayAnimation(
+			CharacterHUD->CharacterOverlay->HighPingAnimation,
+			0.f,
+			5);
+	}
+}
+
+void AMyPlayerController::StopHighPingWarning()
+{
+	CharacterHUD = CharacterHUD == nullptr ? Cast<AMyHUD>(GetHUD()) : CharacterHUD;
+	bool bHUDValid = CharacterHUD &&
+		CharacterHUD->CharacterOverlay &&
+		CharacterHUD->CharacterOverlay->HighPingImage &&
+		CharacterHUD->CharacterOverlay->HighPingAnimation;
+	if (bHUDValid)
+	{
+		CharacterHUD->CharacterOverlay->HighPingImage->SetOpacity(0.f);
+		if (CharacterHUD->CharacterOverlay->IsAnimationPlaying(CharacterHUD->CharacterOverlay->HighPingAnimation))
+		{
+			CharacterHUD->CharacterOverlay->StopAnimation(CharacterHUD->CharacterOverlay->HighPingAnimation);
+		}
+	}
+}
+
+void AMyPlayerController::CheckPing(float DeltaTime)
+{
+	if (HasAuthority()) return;
+	HighPingRunningTime += DeltaTime;
+	if (HighPingRunningTime > CheckPingFrequency)
+	{
+		//PlayerState = PlayerState == nullptr ? GetPlayerState<APlayerState>() : PlayerState;
+		if (PlayerState == nullptr)
+		{
+			PlayerState = GetPlayerState<APlayerState>();
+		}
+		if (PlayerState)
+		{
+			if (PlayerState->GetPingInMilliseconds() > HighPingThreshold) 
+			{
+				HighPingWarning();
+				PingAnimationRunningTime = 0.f;
+				ServerReportPingStatus(true);
+			}
+			else
+			{
+				ServerReportPingStatus(false);
+			}
+		}
+		HighPingRunningTime = 0.f;
+	}
+	bool bHighPingAnimationPlaying =
+		CharacterHUD && CharacterHUD->CharacterOverlay &&
+		CharacterHUD->CharacterOverlay->HighPingAnimation &&
+		CharacterHUD->CharacterOverlay->IsAnimationPlaying(CharacterHUD->CharacterOverlay->HighPingAnimation);
+	if (bHighPingAnimationPlaying)
+	{
+		PingAnimationRunningTime += DeltaTime;
+		if (PingAnimationRunningTime > HighPingDuration)
+		{
+			StopHighPingWarning();
+		}
+	}
+}
+
+void AMyPlayerController::ServerReportPingStatus_Implementation(bool bHighPing)
+{
+	HighPingDelegate.Broadcast(bHighPing);
+}
+
 void AMyPlayerController::ClientJoinMidgame_Implementation(FName StateOfMatch, float Warmup, float Match, float Cooldown, float StartingTime)
 {
 	// pass params at the same time when client join mid game instead of replicate all properties
@@ -261,7 +343,8 @@ void AMyPlayerController::ClientReportServerTime_Implementation(float TimeOfClie
 	// RoundTripTime - time taken for data to travel across the network (client -> server -> client)
 	// assume that it take the same time from client to server and from server to client
 	float RoundTripTime = GetWorld()->GetTimeSeconds() - TimeOfClientRequest; 
-	float CurrentServerTime = TimeServerReceivedClientRequest + (0.5f * RoundTripTime);
+	SingleTripTime = 0.5f * RoundTripTime;
+	float CurrentServerTime = TimeServerReceivedClientRequest + SingleTripTime;
 	ClientServerDelta = CurrentServerTime - GetWorld()->GetTimeSeconds(); // difference between client and server time
 }
 

@@ -26,6 +26,7 @@ public:
 	void FireButtonPressed(bool bPressed);
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	void PickupAmmo(EWeaponType WeaponType, int32 AmmoAmount);
+	bool bLocallyReloading = false;
 protected:
 	virtual void BeginPlay() override;
 	void SetAiming(bool bIsAiming);
@@ -34,8 +35,9 @@ protected:
 	UFUNCTION()
 	void OnRep_EquippedWeapon();
 	void Fire();
-	UFUNCTION(Server, Reliable)
-	void ServerFire(const FVector_NetQuantize& TraceHitTarget);
+	void LocalFire(const FVector_NetQuantize& TraceHitTarget);
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerFire(const FVector_NetQuantize& TraceHitTarget, float FireDelay);
 	UFUNCTION(NetMulticast, Reliable)
 	void MulticastFire(const FVector_NetQuantize& TraceHitTarget);
 
@@ -57,8 +59,11 @@ private:
 	class AMyHUD* HUD;
 	UPROPERTY(ReplicatedUsing = OnRep_EquippedWeapon)
 	AWeapon* EquippedWeapon;
-	UPROPERTY(Replicated)
-	bool bAiming;
+	UPROPERTY(ReplicatedUsing = OnRep_Aiming)
+	bool bAiming = false;
+	bool bAimButtonPressed = false; // locally controlled only variable
+	UFUNCTION()
+	void OnRep_Aiming();
 	UPROPERTY(EditAnywhere)
 	float BaseWalkSpeed;
 	UPROPERTY(EditAnywhere)

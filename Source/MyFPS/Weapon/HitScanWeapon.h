@@ -19,8 +19,5 @@ public:
 private:
 
 	UPROPERTY(EditAnywhere)
-	float Damage = 20.f;
-
-	UPROPERTY(EditAnywhere)
 	class UNiagaraSystem* ImpactParticles;
 };

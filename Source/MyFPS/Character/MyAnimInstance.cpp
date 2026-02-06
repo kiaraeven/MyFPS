@@ -67,6 +67,10 @@ void UMyAnimInstance::NativeUpdateAnimation(float DeltaSeconds) {
 			}
 		}
 		bUseFABRIK = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading;
+		if (MyCharacter->IsLocallyControlled() && MyCharacter->GetCombatState() != ECombatState::ECS_ThrowingGrenade)
+		{
+			bUseFABRIK = !MyCharacter->IsLocallyReloading();
+		}
 		bUseAimOffsets = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading && !MyCharacter->GetDisableGameplay();
 		bTransformRightHand = MyCharacter->GetCombatState() != ECombatState::ECS_Reloading && !MyCharacter->GetDisableGameplay();
 	}

@@ -9,7 +9,8 @@
 #include "Casing.h"
 #include "Engine/SkeletalMeshSocket.h"
 #include "MyFPS/PlayerController/MyPlayerController.h"
-
+#include "MyFPS/Components/CombatComponent.h"
+#include "Kismet/KismetMathLibrary.h"
 
 AWeapon::AWeapon()
 {
@@ -89,21 +90,24 @@ void AWeapon::BeginPlay()
 {
 	Super::BeginPlay();
 
-	
-	if (HasAuthority())
-	{
-		// Server-side logic goes here
-		// Enable collision for the area sphere on the server. QueryAndPhysics to allow overlap events and physics interactions.
-		AreaSphere->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics); 
-		AreaSphere->SetCollisionResponseToChannel(ECollisionChannel::ECC_Pawn, ECollisionResponse::ECR_Overlap); // Enable overlap events with pawns
-		AreaSphere->OnComponentBeginOverlap.AddDynamic(this, &AWeapon::OnSphereOverlap);
-		AreaSphere->OnComponentEndOverlap.AddDynamic(this, &AWeapon::OnSphereEndOverlap);
-	}
+	// Show the pickup widget locally
+	AreaSphere->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	AreaSphere->SetCollisionResponseToChannel(ECollisionChannel::ECC_Pawn, ECollisionResponse::ECR_Overlap); // Enable overlap events with pawns
+	AreaSphere->OnComponentBeginOverlap.AddDynamic(this, &AWeapon::OnSphereOverlap);
+	AreaSphere->OnComponentEndOverlap.AddDynamic(this, &AWeapon::OnSphereEndOverlap);
 
 	if (PickupWidget)
 	{
 		PickupWidget->SetVisibility(false);
 	}
+}
+
+void AWeapon::OnEquipped()
+{
+}
+
+void AWeapon::OnDropped()
+{
 }
 
 void AWeapon::OnSphereOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
@@ -130,6 +134,11 @@ void AWeapon::OnSphereEndOverlap(UPrimitiveComponent* OverlappedComponent, AActo
 			MyCharacter->SetOverlappingWeapon(nullptr);
 		}
 	}
+}
+
+void AWeapon::OnPingTooHigh(bool bPingTooHigh)
+{
+	bUseServerSideRewind = !bPingTooHigh;
 }
 
 void AWeapon::OnRep_WeaponState()
@@ -160,9 +169,25 @@ void AWeapon::OnRep_WeaponState()
 	}
 }
 
-void AWeapon::OnRep_Ammo()
+
+void AWeapon::ClientUpdateAmmo_Implementation(int32 ServerAmmo)
 {
+	if (HasAuthority()) return;
+	Ammo = ServerAmmo;
+	--Sequence;
+	Ammo -= Sequence;
+	SetHUDAmmo();
+}
+
+void AWeapon::ClientAddAmmo_Implementation(int32 AmmoToAdd)
+{
+	if (HasAuthority()) return;
+	Ammo = FMath::Clamp(Ammo + AmmoToAdd, 0, MagCapacity);
 	MyOwnerCharacter = MyOwnerCharacter == nullptr ? Cast<AMyCharacter>(GetOwner()) : MyOwnerCharacter;
+	/*if (MyOwnerCharacter && MyOwnerCharacter->GetCombat() && AmmoIsFull())
+	{
+		MyOwnerCharacter->GetCombat()->JumpToShotgunEnd();
+	}*/
 	SetHUDAmmo();
 }
 
@@ -170,6 +195,22 @@ void AWeapon::SpendRound()
 {
 	Ammo = FMath::Clamp(Ammo - 1, 0, MagCapacity);
 	SetHUDAmmo();
+
+	if (HasAuthority())
+	{
+		ClientUpdateAmmo(Ammo);
+	}
+	else
+	{
+		++Sequence;
+	}
+}
+
+void AWeapon::AddAmmo(int32 AmmoToAdd)
+{
+	Ammo = FMath::Clamp(Ammo + AmmoToAdd, 0, MagCapacity);
+	SetHUDAmmo();
+	ClientAddAmmo(AmmoToAdd);
 }
 
 void AWeapon::SetWeaponState(EWeaponState State)
@@ -208,7 +249,10 @@ bool AWeapon::AmmoIsEmpty()
 	return Ammo <= 0;
 }
 
-
+bool AWeapon::AmmoIsFull()
+{
+	return Ammo == MagCapacity;
+}
 
 
 void AWeapon::Tick(float DeltaTime)
@@ -227,17 +271,12 @@ void AWeapon::Dropped()
 	MyOwnerController = nullptr;
 }
 
-void AWeapon::AddAmmo(int32 AmmoToAdd)
-{
-	Ammo = FMath::Clamp(Ammo - AmmoToAdd, 0, MagCapacity);
-	SetHUDAmmo();
-}
 
 void AWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AWeapon, WeaponState); // register WeaponState for replication
-	DOREPLIFETIME(AWeapon, Ammo);
+	DOREPLIFETIME_CONDITION(AWeapon, bUseServerSideRewind, COND_OwnerOnly);
 }
 
 void AWeapon::OnRep_Owner()

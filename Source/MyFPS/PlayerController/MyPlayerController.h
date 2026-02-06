@@ -4,6 +4,8 @@
 #include "GameFramework/PlayerController.h"
 #include "MyPlayerController.generated.h"
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FHighPingDelegate, bool, bPingTooHigh);
+
 /**
  * 
  */
@@ -29,6 +31,10 @@ public:
 	void OnMatchStateSet(FName State);
 	void HandleMatchHasStarted();
 	void HandleCooldown();
+
+	float SingleTripTime = 0.f;
+	FHighPingDelegate HighPingDelegate;
+
 protected:
 	virtual void BeginPlay() override;
 	void SetHUDTime();
@@ -56,6 +62,12 @@ protected:
 	void ServerCheckMatchState();
 	UFUNCTION(Client, Reliable)
 	void ClientJoinMidgame(FName StateOfMatch, float Warmup, float Match, float Cooldown, float StartingTime);
+
+	void HighPingWarning(); // Show highping warning image on character overlay
+	void StopHighPingWarning();
+	void CheckPing(float DeltaTime);
+	UFUNCTION(Server, Reliable)
+	void ServerReportPingStatus(bool bHighPing);
 private:
 	UPROPERTY()
 	class AMyHUD* CharacterHUD;
@@ -88,4 +100,13 @@ private:
 	bool bInitializeCarriedAmmo = false;
 	float HUDWeaponAmmo;
 	bool bInitializeWeaponAmmo = false;
+
+	float HighPingRunningTime = 0.f; // how much time passed since last warning
+	UPROPERTY(EditAnywhere)
+	float HighPingDuration = 5.f; // each time play anim for 5 sec
+	float PingAnimationRunningTime = 0.f;
+	UPROPERTY(EditAnywhere)
+	float CheckPingFrequency = 20.f; // check ping every 20 sec
+	UPROPERTY(EditAnywhere)
+	float HighPingThreshold = 50.f;
 };
