@@ -93,8 +93,8 @@ void AMyPlayerController::SetHUDCarriedAmmo(int32 Ammo)
 	}
 	else
 	{
-		bInitializeWeaponAmmo = true;
-		HUDWeaponAmmo = Ammo;
+		bInitializeCarriedAmmo = true;
+		HUDCarriedAmmo = Ammo;
 	}
 }
 
@@ -366,6 +366,7 @@ void AMyPlayerController::PollInit()
 			CharacterOverlay = CharacterHUD->CharacterOverlay;
 			if (CharacterOverlay)
 			{
+				if (bInitializeCharacterOverlay) SetHUDHealth(HUDHealth, HUDMaxHealth);
 				if (bInitializeScore) SetHUDScore(HUDScore);
 				if (bInitializeDefeats) SetHUDDefeats(HUDDefeats);
 				if (bInitializeCarriedAmmo) SetHUDCarriedAmmo(HUDCarriedAmmo);

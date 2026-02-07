@@ -20,7 +20,8 @@ void AProjectileBullet::OnHit(UPrimitiveComponent* HitComp, AActor* OtherActor, 
 
 void AProjectileBullet::BeginPlay()
 {
-	/*Super::BeginPlay();
+	Super::BeginPlay();
+	/*
 
 	FPredictProjectilePathParams PathParams;
 	PathParams.bTraceWithChannel = true;
