@@ -1,8 +1,14 @@
 #include "RDGPostProcessSceneViewExtension.h"
 
+#include "RDGPostProcessSettingsProvider.h"
+
 #include "DataDrivenShaderPlatformInfo.h"
+#include "Engine/PostProcessVolume.h"
+#include "EngineUtils.h"
 #include "GlobalShader.h"
 #include "RenderGraphUtils.h"
+#include "RenderingThread.h"
+#include "SceneInterface.h"
 #include "SceneView.h"
 #include "ScreenPass.h"
 #include "ShaderParameterStruct.h"
@@ -18,6 +24,90 @@ static TAutoConsoleVariable<int32> CVarRDGPostProcessKuwaharaRadius(
 	4,
 	TEXT("Sets the Kuwahara filter radius used by the RDG compute pass."),
 	ECVF_RenderThreadSafe);
+
+namespace
+{
+FRDGPostProcessSceneViewExtension::FKuwaharaSettingsSnapshot BuildSettingsSnapshot(FSceneViewFamily& InViewFamily)
+{
+	FRDGPostProcessSceneViewExtension::FKuwaharaSettingsSnapshot Snapshot;
+	Snapshot.bEnabled = CVarRDGPostProcessEnable.GetValueOnGameThread() != 0;
+	Snapshot.Radius = FMath::Max(static_cast<float>(CVarRDGPostProcessKuwaharaRadius.GetValueOnGameThread()), 0.0f);
+
+	if (InViewFamily.Scene == nullptr || InViewFamily.Views.Num() == 0 || InViewFamily.Views[0] == nullptr)
+	{
+		return Snapshot;
+	}
+
+	UWorld* World = InViewFamily.Scene->GetWorld();
+	if (!IsValid(World))
+	{
+		return Snapshot;
+	}
+
+	const FVector ViewLocation = InViewFamily.Views[0]->ViewLocation;
+
+	APostProcessVolume* BestVolume = nullptr;
+	float BestPriority = -TNumericLimits<float>::Max();
+	float BestDistance = TNumericLimits<float>::Max();
+
+	for (TActorIterator<APostProcessVolume> VolumeIt(World); VolumeIt; ++VolumeIt)
+	{
+		APostProcessVolume* Volume = *VolumeIt;
+		if (!IsValid(Volume) || !Volume->bEnabled || Volume->BlendWeight <= 0.0f)
+		{
+			continue;
+		}
+
+		float DistanceToPoint = 0.0f;
+		const bool bAffectsView = Volume->bUnbound || Volume->EncompassesPoint(ViewLocation, 0.0f, &DistanceToPoint);
+		if (!bAffectsView)
+		{
+			continue;
+		}
+
+		if (BestVolume == nullptr ||
+			Volume->Priority > BestPriority ||
+			(FMath::IsNearlyEqual(Volume->Priority, BestPriority) && DistanceToPoint < BestDistance))
+		{
+			BestVolume = Volume;
+			BestPriority = Volume->Priority;
+			BestDistance = DistanceToPoint;
+		}
+	}
+
+	const ARDGPostProcessSettingsProvider* GlobalProvider = nullptr;
+	const ARDGPostProcessSettingsProvider* MatchedProvider = nullptr;
+
+	for (TActorIterator<ARDGPostProcessSettingsProvider> ProviderIt(World); ProviderIt; ++ProviderIt)
+	{
+		const ARDGPostProcessSettingsProvider* Provider = *ProviderIt;
+		if (!IsValid(Provider))
+		{
+			continue;
+		}
+
+		if (Provider->TargetVolume == BestVolume)
+		{
+			MatchedProvider = Provider;
+			break;
+		}
+
+		if (Provider->TargetVolume == nullptr && GlobalProvider == nullptr)
+		{
+			GlobalProvider = Provider;
+		}
+	}
+
+	const ARDGPostProcessSettingsProvider* Provider = MatchedProvider != nullptr ? MatchedProvider : GlobalProvider;
+	if (Provider != nullptr)
+	{
+		Provider->ResolveSettings(Snapshot.bEnabled, Snapshot.Radius);
+		Snapshot.Radius = FMath::Max(Snapshot.Radius, 0.0f);
+	}
+
+	return Snapshot;
+}
+}
 
 class FRDGPostProcessKuwaharaCS : public FGlobalShader
 {
@@ -50,6 +140,14 @@ FRDGPostProcessSceneViewExtension::FRDGPostProcessSceneViewExtension(const FAuto
 {
 }
 
+FRDGPostProcessSceneViewExtension::~FRDGPostProcessSceneViewExtension()
+{
+	if (!SettingsUploadFence.IsFenceComplete())
+	{
+		SettingsUploadFence.Wait();
+	}
+}
+
 void FRDGPostProcessSceneViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
 {
 }
@@ -60,13 +158,23 @@ void FRDGPostProcessSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily
 
 void FRDGPostProcessSceneViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
 {
+	const FKuwaharaSettingsSnapshot Snapshot = BuildSettingsSnapshot(InViewFamily);
+
+	// Snapshot provider values on the game thread and hand them to the render thread by value.
+	ENQUEUE_RENDER_COMMAND(RDGPostProcess_UpdateSettings)(
+		[this, Snapshot](FRHICommandListImmediate& RHICmdList)
+		{
+			RenderThreadSettings = Snapshot;
+		});
+	SettingsUploadFence.BeginFence();
 }
 
 void FRDGPostProcessSceneViewExtension::PostRenderViewFamily_RenderThread(
 	FRDGBuilder& GraphBuilder,
 	FSceneViewFamily& InViewFamily)
 {
-	if (CVarRDGPostProcessEnable.GetValueOnRenderThread() == 0)
+	const FKuwaharaSettingsSnapshot Settings = RenderThreadSettings;
+	if (!Settings.bEnabled)
 	{
 		return;
 	}
@@ -102,7 +210,7 @@ void FRDGPostProcessSceneViewExtension::PostRenderViewFamily_RenderThread(
 
 	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("RDGPostProcess.KuwaharaOutput"));
 
-	const uint32 Radius = static_cast<uint32>(FMath::Max(CVarRDGPostProcessKuwaharaRadius.GetValueOnRenderThread(), 0));
+	const uint32 Radius = static_cast<uint32>(FMath::RoundToInt(FMath::Max(Settings.Radius, 0.0f)));
 
 	FRDGPostProcessKuwaharaCS::FParameters* PassParameters =
 		GraphBuilder.AllocParameters<FRDGPostProcessKuwaharaCS::FParameters>();
@@ -134,5 +242,5 @@ void FRDGPostProcessSceneViewExtension::PostRenderViewFamily_RenderThread(
 
 bool FRDGPostProcessSceneViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const
 {
-	return CVarRDGPostProcessEnable.GetValueOnAnyThread() != 0;
+	return true;
 }

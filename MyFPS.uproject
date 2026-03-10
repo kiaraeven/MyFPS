@@ -16,6 +16,10 @@
 	],
 	"Plugins": [
 		{
+			"Name": "RDGPostProcess",
+			"Enabled": true
+		},
+		{
 			"Name": "ModelingToolsEditorMode",
 			"Enabled": true,
 			"TargetAllowList": [

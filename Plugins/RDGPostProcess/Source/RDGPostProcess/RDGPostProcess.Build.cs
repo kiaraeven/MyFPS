@@ -10,13 +10,13 @@ public class RDGPostProcess : ModuleRules
 			new[]
 			{
 				"Core",
+				"CoreUObject",
+				"Engine",
 			});
 
 		PrivateDependencyModuleNames.AddRange(
 			new[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Projects",
 				"RenderCore",
 				"Renderer",
