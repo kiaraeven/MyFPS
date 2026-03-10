@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "RDG Post Process",
+	"Description": "Boilerplate runtime plugin that demonstrates an RDG post-process pass implemented with FSceneViewExtension and a global shader.",
+	"Category": "Rendering",
+	"CanContainContent": false,
+	"EnabledByDefault": false,
+	"IsExperimentalVersion": true,
+	"Modules": [
+		{
+			"Name": "RDGPostProcess",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

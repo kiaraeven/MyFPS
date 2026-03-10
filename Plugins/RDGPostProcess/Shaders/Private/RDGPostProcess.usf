@@ -1,0 +1,7 @@
+#pragma once
+
+float4 RDGPostProcessLoadClamped(Texture2D<float4> Texture, int2 Pixel, int2 Extent)
+{
+	const int2 ClampedPixel = clamp(Pixel, int2(0, 0), Extent - 1);
+	return Texture.Load(int3(ClampedPixel, 0));
+}

@@ -1,0 +1,109 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/RDGPostProcess/Private/RDGPostProcess.usf"
+
+uint Radius;
+Texture2D<float4> InputTexture;
+RWTexture2D<float4> OutputTexture;
+
+float RegionVariance(float3 Mean, float3 MeanSquare)
+{
+	const float3 Variance = abs(MeanSquare - Mean * Mean);
+	return Variance.r + Variance.g + Variance.b;
+}
+
+void ComputeRegionStats(
+	int2 Pixel,
+	int2 Extent,
+	int2 MinOffset,
+	int2 MaxOffset,
+	out float3 OutMean,
+	out float OutVariance)
+{
+	float3 Sum = 0.0f;
+	float3 SumSquares = 0.0f;
+	int SampleCount = 0;
+
+	[loop]
+	for (int Y = MinOffset.y; Y <= MaxOffset.y; ++Y)
+	{
+		[loop]
+		for (int X = MinOffset.x; X <= MaxOffset.x; ++X)
+		{
+			const float3 Sample = RDGPostProcessLoadClamped(InputTexture, Pixel + int2(X, Y), Extent).rgb;
+			Sum += Sample;
+			SumSquares += Sample * Sample;
+			++SampleCount;
+		}
+	}
+
+	const float InvSampleCount = 1.0f / max(SampleCount, 1);
+	OutMean = Sum * InvSampleCount;
+	OutVariance = RegionVariance(OutMean, SumSquares * InvSampleCount);
+}
+
+[numthreads(32, 32, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Width;
+	uint Height;
+	OutputTexture.GetDimensions(Width, Height);
+
+	if (DispatchThreadId.x >= Width || DispatchThreadId.y >= Height)
+	{
+		return;
+	}
+
+	const int2 Pixel = int2(DispatchThreadId.xy);
+	const int2 Extent = int2(Width, Height);
+	const int RadiusInt = max(int(Radius), 0);
+
+	if (RadiusInt == 0)
+	{
+		OutputTexture[Pixel] = RDGPostProcessLoadClamped(InputTexture, Pixel, Extent);
+		return;
+	}
+
+	float3 BestMean = 0.0f;
+	float BestVariance = 0.0f;
+	bool bHasBestRegion = false;
+
+	[unroll]
+	for (int RegionIndex = 0; RegionIndex < 4; ++RegionIndex)
+	{
+		int2 MinOffset = int2(0, 0);
+		int2 MaxOffset = int2(0, 0);
+		if (RegionIndex == 0)
+		{
+			MinOffset = int2(-RadiusInt, -RadiusInt);
+			MaxOffset = int2(0, 0);
+		}
+		else if (RegionIndex == 1)
+		{
+			MinOffset = int2(0, -RadiusInt);
+			MaxOffset = int2(RadiusInt, 0);
+		}
+		else if (RegionIndex == 2)
+		{
+			MinOffset = int2(-RadiusInt, 0);
+			MaxOffset = int2(0, RadiusInt);
+		}
+		else
+		{
+			MinOffset = int2(0, 0);
+			MaxOffset = int2(RadiusInt, RadiusInt);
+		}
+
+		float3 Mean = 0.0f;
+		float Variance = 0.0f;
+		ComputeRegionStats(Pixel, Extent, MinOffset, MaxOffset, Mean, Variance);
+
+		if (!bHasBestRegion || Variance < BestVariance)
+		{
+			bHasBestRegion = true;
+			BestVariance = Variance;
+			BestMean = Mean;
+		}
+	}
+
+	OutputTexture[Pixel] = float4(BestMean, 1.0f);
+}
