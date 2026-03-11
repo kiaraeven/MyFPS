@@ -2,11 +2,20 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "RDGPostProcessSettingsAsset.h"
 
 #include "RDGPostProcessSettingsProvider.generated.h"
 
 class APostProcessVolume;
 class URDGPostProcessSettingsAsset;
+
+struct FRDGResolvedPostProcessSettings
+{
+	bool bEnabled = false;
+	float Radius = 0.0f;
+	bool bOutlineEnabled = false;
+	FOutlineSettings OutlineSettings;
+};
 
 UCLASS(BlueprintType, Blueprintable)
 class RDGPOSTPROCESS_API ARDGPostProcessSettingsProvider : public AActor
@@ -28,5 +37,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "32.0"))
 	float Radius = 4.0f;
 
-	bool ResolveSettings(bool& OutEnabled, float& OutRadius) const;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline")
+	bool bEnableOutline = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline", meta = (ShowOnlyInnerProperties))
+	FOutlineSettings OutlineSettings;
+
+	bool ResolveSettings(FRDGResolvedPostProcessSettings& OutSettings) const;
 };

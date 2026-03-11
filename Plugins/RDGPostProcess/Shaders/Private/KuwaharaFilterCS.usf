@@ -2,8 +2,15 @@
 #include "/Plugin/RDGPostProcess/Private/RDGPostProcess.usf"
 
 uint Radius;
+int2 ViewRectMin;
+int2 ViewRectSize;
 Texture2D<float4> InputTexture;
 RWTexture2D<float4> OutputTexture;
+
+int2 ClampToViewRect(int2 Pixel)
+{
+	return clamp(Pixel, ViewRectMin, ViewRectMin + ViewRectSize - 1);
+}
 
 float RegionVariance(float3 Mean, float3 MeanSquare)
 {
@@ -29,7 +36,7 @@ void ComputeRegionStats(
 		[loop]
 		for (int X = MinOffset.x; X <= MaxOffset.x; ++X)
 		{
-			const float3 Sample = RDGPostProcessLoadClamped(InputTexture, Pixel + int2(X, Y), Extent).rgb;
+			const float3 Sample = RDGPostProcessLoadClamped(InputTexture, ClampToViewRect(Pixel + int2(X, Y)), Extent).rgb;
 			Sum += Sample;
 			SumSquares += Sample * Sample;
 			++SampleCount;
@@ -53,13 +60,19 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
-	const int2 Pixel = int2(DispatchThreadId.xy);
+	if (DispatchThreadId.x >= ViewRectSize.x || DispatchThreadId.y >= ViewRectSize.y)
+	{
+		return;
+	}
+
+	const int2 Pixel = ViewRectMin + int2(DispatchThreadId.xy);
 	const int2 Extent = int2(Width, Height);
 	const int RadiusInt = max(int(Radius), 0);
+	const float4 BaseColor = RDGPostProcessLoadClamped(InputTexture, Pixel, Extent);
 
 	if (RadiusInt == 0)
 	{
-		OutputTexture[Pixel] = RDGPostProcessLoadClamped(InputTexture, Pixel, Extent);
+		OutputTexture[Pixel] = BaseColor;
 		return;
 	}
 
@@ -105,5 +118,5 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		}
 	}
 
-	OutputTexture[Pixel] = float4(BestMean, 1.0f);
+	OutputTexture[Pixel] = float4(BestMean, BaseColor.a);
 }

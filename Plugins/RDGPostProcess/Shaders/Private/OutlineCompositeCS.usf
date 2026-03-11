@@ -1,0 +1,219 @@
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/RDGPostProcess/Private/RDGPostProcess.usf"
+
+struct FOutlineSettings
+{
+	float4 Color;
+	float EdgeThreshold;
+	float Softness;
+	float GlowIntensity;
+	float PulseSpeed;
+};
+
+float4 OutlineColor;
+float EdgeThreshold;
+float Softness;
+float GlowIntensity;
+float PulseSpeed;
+int2 ViewRectMin;
+int2 ViewRectSize;
+Texture2D<float4> InputTexture;
+Texture2D<float> SceneDepthTexture;
+Texture2D<float4> SceneNormalTexture;
+SamplerState InputSampler;
+SamplerState SceneDepthSampler;
+SamplerState SceneNormalSampler;
+RWTexture2D<float4> OutputTexture;
+
+FOutlineSettings MakeOutlineSettings()
+{
+	FOutlineSettings Settings;
+	Settings.Color = OutlineColor;
+	Settings.EdgeThreshold = max(EdgeThreshold, 1e-4f);
+	Settings.Softness = saturate(Softness);
+	Settings.GlowIntensity = max(GlowIntensity, 0.0f);
+	Settings.PulseSpeed = max(PulseSpeed, 0.0f);
+	return Settings;
+}
+
+float2 GetOutlineJitterViewportOffset()
+{
+	return ScreenPosToViewportUV(ResolvedView.TemporalAAJitter.xy) - float2(0.5f, 0.5f);
+}
+
+float2 MakeStableBufferUV(float2 PixelPosition)
+{
+	const float2 BufferUV = PixelPosition * View.BufferSizeAndInvSize.zw;
+	const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 UnjitteredViewportUV = ViewportUV - GetOutlineJitterViewportOffset();
+	return clamp(ViewportUVToBufferUV(UnjitteredViewportUV), ResolvedView.BufferBilinearUVMinMax.xy, ResolvedView.BufferBilinearUVMinMax.zw);
+}
+
+float2 ClampOutlineBufferUV(float2 BufferUV)
+{
+	return clamp(BufferUV, ResolvedView.BufferBilinearUVMinMax.xy, ResolvedView.BufferBilinearUVMinMax.zw);
+}
+
+float LoadLinearSceneDepth(float2 BufferUV)
+{
+	const float DeviceDepth = SceneDepthTexture.SampleLevel(SceneDepthSampler, ClampOutlineBufferUV(BufferUV), 0);
+	return ConvertFromDeviceZ(DeviceDepth);
+}
+
+float3 LoadSceneNormal(float2 BufferUV)
+{
+	float3 EncodedNormal = Texture2DSampleLevel(SceneNormalTexture, SceneNormalSampler, ClampOutlineBufferUV(BufferUV), 0).xyz * 2.0f - 1.0f;
+	const float LengthSq = dot(EncodedNormal, EncodedNormal);
+	if (LengthSq <= 1e-4f)
+	{
+		return float3(0.0f, 0.0f, 1.0f);
+	}
+
+	return normalize(EncodedNormal);
+}
+
+float SampleKernelWeight(int2 Offset)
+{
+	return all(abs(Offset) == int2(1, 1)) ? 1.0f : 2.0f;
+}
+
+float ComputeSoftEdgeWeight(float Difference, float Threshold, float SoftnessFactor)
+{
+	const float SoftRange = max(max(Threshold, 1e-4f) * max(SoftnessFactor, 0.0f), 1e-4f);
+	return smoothstep(max(Threshold - SoftRange, 0.0f), Threshold + SoftRange, Difference);
+}
+
+float ComputeDepthEdgeMetric(float2 BufferUV, float2 TexelSize)
+{
+	const float CenterDepth = LoadLinearSceneDepth(BufferUV);
+	float WeightedDifference = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -1; SampleY <= 1; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -1; SampleX <= 1; ++SampleX)
+		{
+			const int2 Offset = int2(SampleX, SampleY);
+			if (all(Offset == int2(0, 0)))
+			{
+				continue;
+			}
+
+			const float Weight = SampleKernelWeight(Offset);
+			const float NeighborDepth = LoadLinearSceneDepth(BufferUV + float2(Offset) * TexelSize);
+			const float RelativeDifference = abs(NeighborDepth - CenterDepth) / max(max(CenterDepth, NeighborDepth), 1.0f);
+			WeightedDifference += RelativeDifference * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? WeightedDifference / WeightSum : 0.0f;
+}
+
+float ComputeNormalEdgeMetric(float2 BufferUV, float2 TexelSize)
+{
+	const float3 CenterNormal = LoadSceneNormal(BufferUV);
+	float WeightedDifference = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -1; SampleY <= 1; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -1; SampleX <= 1; ++SampleX)
+		{
+			const int2 Offset = int2(SampleX, SampleY);
+			if (all(Offset == int2(0, 0)))
+			{
+				continue;
+			}
+
+			const float Weight = SampleKernelWeight(Offset);
+			const float3 NeighborNormal = LoadSceneNormal(BufferUV + float2(Offset) * TexelSize);
+			WeightedDifference += length(NeighborNormal - CenterNormal) * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? WeightedDifference / WeightSum : 0.0f;
+}
+
+float ComputeEdgeStrength(float2 BufferUV, float2 TexelSize, FOutlineSettings Settings)
+{
+	const float DepthMetric = ComputeDepthEdgeMetric(BufferUV, TexelSize);
+	const float NormalMetric = ComputeNormalEdgeMetric(BufferUV, TexelSize);
+	const float DepthEdge = ComputeSoftEdgeWeight(DepthMetric, Settings.EdgeThreshold, Settings.Softness);
+	const float NormalThreshold = max(Settings.EdgeThreshold * 1.75f, 0.04f);
+	const float NormalEdge = ComputeSoftEdgeWeight(NormalMetric * 0.5f, NormalThreshold, max(Settings.Softness * 0.75f, 0.05f));
+	return saturate(max(DepthEdge, NormalEdge * 0.65f));
+}
+
+float ComputeGlowScatter(float2 BufferUV, float2 TexelSize, FOutlineSettings Settings)
+{
+	float Glow = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -2; SampleY <= 2; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -2; SampleX <= 2; ++SampleX)
+		{
+			const float DistanceSq = float(SampleX * SampleX + SampleY * SampleY);
+			if (DistanceSq > 2.0f)
+			{
+				continue;
+			}
+
+			const float Weight = (SampleX == 0 && SampleY == 0) ? 4.0f : SampleKernelWeight(int2(abs(SampleX), abs(SampleY)));
+			const float SampleEdgeStrength = ComputeEdgeStrength(BufferUV + float2(SampleX, SampleY) * TexelSize, TexelSize, Settings);
+			Glow += SampleEdgeStrength * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? Glow / WeightSum : 0.0f;
+}
+
+[numthreads(32, 32, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	ResolvedView = ResolveView();
+
+	uint Width;
+	uint Height;
+	OutputTexture.GetDimensions(Width, Height);
+
+	if (DispatchThreadId.x >= Width || DispatchThreadId.y >= Height)
+	{
+		return;
+	}
+
+	if (DispatchThreadId.x >= ViewRectSize.x || DispatchThreadId.y >= ViewRectSize.y)
+	{
+		return;
+	}
+
+	const int2 Pixel = ViewRectMin + int2(DispatchThreadId.xy);
+	const FOutlineSettings Settings = MakeOutlineSettings();
+	const float2 PixelPosition = float2(Pixel) + 0.5f;
+	const float2 PixelBufferUV = ClampOutlineBufferUV(PixelPosition * View.BufferSizeAndInvSize.zw);
+	const float2 StableBufferUV = MakeStableBufferUV(PixelPosition);
+	const float2 TexelSize = View.BufferSizeAndInvSize.zw;
+	const float4 BaseColor = Texture2DSampleLevel(InputTexture, InputSampler, PixelBufferUV, 0);
+
+	const float CoreEdgeStrength = ComputeEdgeStrength(StableBufferUV, TexelSize, Settings);
+	const float GlowScatter = ComputeGlowScatter(StableBufferUV, TexelSize, Settings);
+	const float GlowEdgeStrength = saturate(max(CoreEdgeStrength, GlowScatter * 0.9f));
+	const float Pulse = Settings.PulseSpeed > 0.0f
+		? (0.55f + 0.45f * (0.5f + 0.5f * sin(ResolvedView.GameTime * Settings.PulseSpeed)))
+		: 1.0f;
+	const float BlendAlpha = saturate(Settings.Color.a * GlowEdgeStrength * Pulse);
+	const float3 LaserColor = Settings.Color.rgb * Settings.GlowIntensity * lerp(0.9f, 1.25f, Pulse);
+
+	OutputTexture[Pixel] = float4(
+		lerp(BaseColor.rgb, LaserColor, BlendAlpha),
+		BaseColor.a);
+}

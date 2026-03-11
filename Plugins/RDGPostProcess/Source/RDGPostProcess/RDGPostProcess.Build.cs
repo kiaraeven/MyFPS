@@ -1,3 +1,4 @@
+using System.IO;
 using UnrealBuildTool;
 
 public class RDGPostProcess : ModuleRules
@@ -21,6 +22,13 @@ public class RDGPostProcess : ModuleRules
 				"RenderCore",
 				"Renderer",
 				"RHI",
+			});
+
+		PrivateIncludePaths.AddRange(
+			new[]
+			{
+				Path.Combine(EngineDirectory, "Source", "Runtime", "Renderer", "Internal"),
+				Path.Combine(EngineDirectory, "Source", "Runtime", "Renderer", "Private"),
 			});
 	}
 }
