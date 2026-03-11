@@ -38,6 +38,8 @@ static TAutoConsoleVariable<float> CVarOutlineSoftness(
 
 namespace
 {
+constexpr float GlobalProviderPriority = -1000000.0f;
+
 FRDGResolvedPostProcessSettings BuildDefaultSettings()
 {
 	FRDGResolvedPostProcessSettings Settings;
@@ -46,13 +48,22 @@ FRDGResolvedPostProcessSettings BuildDefaultSettings()
 	return Settings;
 }
 
-void ApplyRenderThreadOverrides(FRDGResolvedPostProcessSettings& Settings)
+void SanitizeSettings(FRDGResolvedPostProcessSettings& Settings)
 {
 	Settings.Radius = FMath::Max(Settings.Radius, 0.0f);
 	Settings.OutlineSettings.EdgeThreshold = FMath::Max(Settings.OutlineSettings.EdgeThreshold, 0.0f);
 	Settings.OutlineSettings.GlowIntensity = FMath::Max(Settings.OutlineSettings.GlowIntensity, 0.0f);
 	Settings.OutlineSettings.PulseSpeed = FMath::Max(Settings.OutlineSettings.PulseSpeed, 0.0f);
 	Settings.OutlineSettings.Softness = FMath::Clamp(Settings.OutlineSettings.Softness, 0.0f, 1.0f);
+	Settings.OutlineSettings.GlitchIntensity = FMath::Clamp(Settings.OutlineSettings.GlitchIntensity, 0.0f, 1.0f);
+	Settings.OutlineSettings.RGBShiftAmount = FMath::Max(Settings.OutlineSettings.RGBShiftAmount, 0.0f);
+	Settings.OutlineSettings.BlockSliceAmount = FMath::Clamp(Settings.OutlineSettings.BlockSliceAmount, 0.0f, 1.0f);
+	Settings.OutlineSettings.StaticNoiseLevel = FMath::Clamp(Settings.OutlineSettings.StaticNoiseLevel, 0.0f, 1.0f);
+}
+
+void ApplyRenderThreadOverrides(FRDGResolvedPostProcessSettings& Settings)
+{
+	SanitizeSettings(Settings);
 
 	const float SoftnessOverride = CVarOutlineSoftness.GetValueOnRenderThread();
 	if (SoftnessOverride >= 0.0f)
@@ -61,64 +72,79 @@ void ApplyRenderThreadOverrides(FRDGResolvedPostProcessSettings& Settings)
 	}
 }
 
-APostProcessVolume* FindBestActiveVolume(UWorld* World, const FVector& ViewLocation)
+bool HasGlitchEffect(const FRDGResolvedPostProcessSettings& Settings)
 {
-	APostProcessVolume* BestVolume = nullptr;
-	float BestPriority = -TNumericLimits<float>::Max();
-	float BestDistance = TNumericLimits<float>::Max();
-
-	for (TActorIterator<APostProcessVolume> VolumeIt(World); VolumeIt; ++VolumeIt)
-	{
-		APostProcessVolume* Volume = *VolumeIt;
-		if (!IsValid(Volume) || !Volume->bEnabled || Volume->BlendWeight <= 0.0f)
-		{
-			continue;
-		}
-
-		float DistanceToPoint = 0.0f;
-		const bool bAffectsView = Volume->bUnbound || Volume->EncompassesPoint(ViewLocation, 0.0f, &DistanceToPoint);
-		if (!bAffectsView)
-		{
-			continue;
-		}
-
-		if (BestVolume == nullptr ||
-			Volume->Priority > BestPriority ||
-			(FMath::IsNearlyEqual(Volume->Priority, BestPriority) && DistanceToPoint < BestDistance))
-		{
-			BestVolume = Volume;
-			BestPriority = Volume->Priority;
-			BestDistance = DistanceToPoint;
-		}
-	}
-
-	return BestVolume;
+	return Settings.bGlitchEnabled &&
+		Settings.OutlineSettings.GlitchIntensity > KINDA_SMALL_NUMBER &&
+		(Settings.OutlineSettings.RGBShiftAmount > KINDA_SMALL_NUMBER ||
+			Settings.OutlineSettings.BlockSliceAmount > KINDA_SMALL_NUMBER ||
+			Settings.OutlineSettings.StaticNoiseLevel > KINDA_SMALL_NUMBER);
 }
 
-const ARDGPostProcessSettingsProvider* FindSettingsProvider(UWorld* World, const APostProcessVolume* ActiveVolume)
+bool HasNPRFinalPass(const FRDGResolvedPostProcessSettings& Settings)
 {
-	const ARDGPostProcessSettingsProvider* GlobalProvider = nullptr;
+	return Settings.bOutlineEnabled || HasGlitchEffect(Settings);
+}
 
-	for (TActorIterator<ARDGPostProcessSettingsProvider> ProviderIt(World); ProviderIt; ++ProviderIt)
+float ComputeVolumeBlendWeight(APostProcessVolume* Volume, const FVector& ViewLocation)
+{
+	if (!IsValid(Volume) || !Volume->bEnabled || Volume->BlendWeight <= 0.0f)
 	{
-		const ARDGPostProcessSettingsProvider* Provider = *ProviderIt;
-		if (!IsValid(Provider))
-		{
-			continue;
-		}
-
-		if (Provider->TargetVolume == ActiveVolume)
-		{
-			return Provider;
-		}
-
-		if (Provider->TargetVolume == nullptr && GlobalProvider == nullptr)
-		{
-			GlobalProvider = Provider;
-		}
+		return 0.0f;
 	}
 
-	return GlobalProvider;
+	float DistanceToPoint = 0.0f;
+	const bool bAffectsView = Volume->bUnbound || Volume->EncompassesPoint(ViewLocation, Volume->BlendRadius, &DistanceToPoint);
+	if (!bAffectsView)
+	{
+		return 0.0f;
+	}
+
+	const float BaseWeight = FMath::Clamp(Volume->BlendWeight, 0.0f, 1.0f);
+	if (Volume->bUnbound || Volume->BlendRadius <= 0.0f)
+	{
+		return BaseWeight;
+	}
+
+	const float BlendRadius = FMath::Max(Volume->BlendRadius, 1.0f);
+	const float Falloff = 1.0f - FMath::Clamp(DistanceToPoint / BlendRadius, 0.0f, 1.0f);
+	return BaseWeight * Falloff;
+}
+
+struct FWeightedSettingsContribution
+{
+	FRDGResolvedPostProcessSettings Settings;
+	float Weight = 0.0f;
+	float Priority = GlobalProviderPriority;
+};
+
+void BlendSettingsContribution(
+	FRDGResolvedPostProcessSettings& InOutSettings,
+	float& InOutKuwaharaFactor,
+	float& InOutOutlineFactor,
+	float& InOutGlitchFactor,
+	const FWeightedSettingsContribution& Contribution)
+{
+	const float Weight = FMath::Clamp(Contribution.Weight, 0.0f, 1.0f);
+	if (Weight <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	const FRDGResolvedPostProcessSettings& Source = Contribution.Settings;
+	InOutKuwaharaFactor = FMath::Lerp(InOutKuwaharaFactor, Source.bEnabled ? 1.0f : 0.0f, Weight);
+	InOutOutlineFactor = FMath::Lerp(InOutOutlineFactor, Source.bOutlineEnabled ? 1.0f : 0.0f, Weight);
+	InOutGlitchFactor = FMath::Lerp(InOutGlitchFactor, Source.bGlitchEnabled ? 1.0f : 0.0f, Weight);
+	InOutSettings.Radius = FMath::Lerp(InOutSettings.Radius, Source.Radius, Weight);
+	InOutSettings.OutlineSettings.OutlineColor = FMath::Lerp(InOutSettings.OutlineSettings.OutlineColor, Source.OutlineSettings.OutlineColor, Weight);
+	InOutSettings.OutlineSettings.EdgeThreshold = FMath::Lerp(InOutSettings.OutlineSettings.EdgeThreshold, Source.OutlineSettings.EdgeThreshold, Weight);
+	InOutSettings.OutlineSettings.Softness = FMath::Lerp(InOutSettings.OutlineSettings.Softness, Source.OutlineSettings.Softness, Weight);
+	InOutSettings.OutlineSettings.GlowIntensity = FMath::Lerp(InOutSettings.OutlineSettings.GlowIntensity, Source.OutlineSettings.GlowIntensity, Weight);
+	InOutSettings.OutlineSettings.PulseSpeed = FMath::Lerp(InOutSettings.OutlineSettings.PulseSpeed, Source.OutlineSettings.PulseSpeed, Weight);
+	InOutSettings.OutlineSettings.GlitchIntensity = FMath::Lerp(InOutSettings.OutlineSettings.GlitchIntensity, Source.OutlineSettings.GlitchIntensity, Weight);
+	InOutSettings.OutlineSettings.RGBShiftAmount = FMath::Lerp(InOutSettings.OutlineSettings.RGBShiftAmount, Source.OutlineSettings.RGBShiftAmount, Weight);
+	InOutSettings.OutlineSettings.BlockSliceAmount = FMath::Lerp(InOutSettings.OutlineSettings.BlockSliceAmount, Source.OutlineSettings.BlockSliceAmount, Weight);
+	InOutSettings.OutlineSettings.StaticNoiseLevel = FMath::Lerp(InOutSettings.OutlineSettings.StaticNoiseLevel, Source.OutlineSettings.StaticNoiseLevel, Weight);
 }
 
 FRDGResolvedPostProcessSettings BuildSettingsSnapshot(FSceneViewFamily& InViewFamily)
@@ -137,13 +163,66 @@ FRDGResolvedPostProcessSettings BuildSettingsSnapshot(FSceneViewFamily& InViewFa
 	}
 
 	const FVector ViewLocation = InViewFamily.Views[0]->ViewLocation;
-	const APostProcessVolume* BestVolume = FindBestActiveVolume(World, ViewLocation);
-	const ARDGPostProcessSettingsProvider* Provider = FindSettingsProvider(World, BestVolume);
-	if (Provider != nullptr)
+	TArray<FWeightedSettingsContribution, TInlineAllocator<8>> Contributions;
+
+	for (TActorIterator<ARDGPostProcessSettingsProvider> ProviderIt(World); ProviderIt; ++ProviderIt)
 	{
-		Provider->ResolveSettings(Snapshot);
+		const ARDGPostProcessSettingsProvider* Provider = *ProviderIt;
+		if (!IsValid(Provider))
+		{
+			continue;
+		}
+
+		FRDGResolvedPostProcessSettings ProviderSettings;
+		if (!Provider->ResolveSettings(ProviderSettings))
+		{
+			continue;
+		}
+
+		const float Weight = Provider->TargetVolume != nullptr
+			? ComputeVolumeBlendWeight(Provider->TargetVolume, ViewLocation)
+			: 1.0f;
+		if (Weight <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FWeightedSettingsContribution& Contribution = Contributions.AddDefaulted_GetRef();
+		Contribution.Settings = ProviderSettings;
+		Contribution.Weight = Weight;
+		Contribution.Priority = Provider->TargetVolume != nullptr
+			? Provider->TargetVolume->Priority
+			: GlobalProviderPriority;
 	}
 
+	if (Contributions.Num() == 0)
+	{
+		SanitizeSettings(Snapshot);
+		return Snapshot;
+	}
+
+	Contributions.Sort([](const FWeightedSettingsContribution& A, const FWeightedSettingsContribution& B)
+	{
+		if (!FMath::IsNearlyEqual(A.Priority, B.Priority))
+		{
+			return A.Priority < B.Priority;
+		}
+
+		return A.Weight < B.Weight;
+	});
+
+	float KuwaharaFactor = Snapshot.bEnabled ? 1.0f : 0.0f;
+	float OutlineFactor = Snapshot.bOutlineEnabled ? 1.0f : 0.0f;
+	float GlitchFactor = Snapshot.bGlitchEnabled ? 1.0f : 0.0f;
+	for (const FWeightedSettingsContribution& Contribution : Contributions)
+	{
+		BlendSettingsContribution(Snapshot, KuwaharaFactor, OutlineFactor, GlitchFactor, Contribution);
+	}
+
+	Snapshot.bEnabled = KuwaharaFactor > 0.5f;
+	Snapshot.bOutlineEnabled = OutlineFactor > 0.5f;
+	Snapshot.bGlitchEnabled = GlitchFactor > 0.5f;
+	SanitizeSettings(Snapshot);
 	return Snapshot;
 }
 
@@ -173,15 +252,20 @@ BEGIN_SHADER_PARAMETER_STRUCT(FKuwaharaPassParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 END_SHADER_PARAMETER_STRUCT()
 
-BEGIN_SHADER_PARAMETER_STRUCT(FPostProcessPassParameters, )
+BEGIN_SHADER_PARAMETER_STRUCT(FNPRFinalPassParameters, )
 	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 	SHADER_PARAMETER(FIntPoint, ViewRectMin)
 	SHADER_PARAMETER(FIntPoint, ViewRectSize)
+	SHADER_PARAMETER(float, OutlineIntensity)
 	SHADER_PARAMETER(FVector4f, OutlineColor)
 	SHADER_PARAMETER(float, EdgeThreshold)
 	SHADER_PARAMETER(float, Softness)
 	SHADER_PARAMETER(float, GlowIntensity)
 	SHADER_PARAMETER(float, PulseSpeed)
+	SHADER_PARAMETER(float, GlitchIntensity)
+	SHADER_PARAMETER(float, RGBShiftAmount)
+	SHADER_PARAMETER(float, BlockSliceAmount)
+	SHADER_PARAMETER(float, StaticNoiseLevel)
 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, InputTexture)
 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, SceneDepthTexture)
 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, SceneNormalTexture)
@@ -207,15 +291,15 @@ public:
 	}
 };
 
-class FRDGPostProcessOutlineCS : public FGlobalShader
+class FRDGPostProcessNPRFinalCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FRDGPostProcessOutlineCS);
-	SHADER_USE_PARAMETER_STRUCT(FRDGPostProcessOutlineCS, FGlobalShader);
+	DECLARE_GLOBAL_SHADER(FRDGPostProcessNPRFinalCS);
+	SHADER_USE_PARAMETER_STRUCT(FRDGPostProcessNPRFinalCS, FGlobalShader);
 
 	static constexpr int32 ThreadGroupSize = 32;
 
-	using FParameters = FPostProcessPassParameters;
+	using FParameters = FNPRFinalPassParameters;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -230,14 +314,14 @@ IMPLEMENT_GLOBAL_SHADER(
 	SF_Compute);
 
 IMPLEMENT_GLOBAL_SHADER(
-	FRDGPostProcessOutlineCS,
-	"/Plugin/RDGPostProcess/Private/OutlineCompositeCS.usf",
+	FRDGPostProcessNPRFinalCS,
+	"/Plugin/RDGPostProcess/Private/NPRFinalPassCS.usf",
 	"MainCS",
 	SF_Compute);
 
 namespace
 {
-FRDGTextureRef AddPostProcessChainForView(
+FRDGTextureRef AddMergedPostProcessChainForView(
 	FRDGBuilder& GraphBuilder,
 	const FViewInfo& View,
 	FRDGTextureRef SceneColorTexture,
@@ -245,7 +329,9 @@ FRDGTextureRef AddPostProcessChainForView(
 	FRDGTextureRef SceneNormalTexture,
 	const FRDGResolvedPostProcessSettings& Settings)
 {
-	if ((!Settings.bEnabled && !Settings.bOutlineEnabled) || SceneColorTexture == nullptr)
+	const bool bShouldRunKuwahara = Settings.bEnabled;
+	const bool bShouldRunNPRFinalPass = HasNPRFinalPass(Settings);
+	if ((!bShouldRunKuwahara && !bShouldRunNPRFinalPass) || SceneColorTexture == nullptr)
 	{
 		return SceneColorTexture;
 	}
@@ -268,18 +354,16 @@ FRDGTextureRef AddPostProcessChainForView(
 	}
 
 	TShaderMapRef<FRDGPostProcessKuwaharaCS> ComputeShader(View.ShaderMap);
-	TShaderMapRef<FRDGPostProcessOutlineCS> OutlineShader(View.ShaderMap);
+	TShaderMapRef<FRDGPostProcessNPRFinalCS> NPRFinalShader(View.ShaderMap);
 
 	FRDGTextureRef ChainedColorTexture = SceneColorTexture;
 	const FRDGTextureDesc OutputDesc = CreatePostProcessOutputDesc(SceneColorTexture);
 
-	if (Settings.bEnabled)
+	if (bShouldRunKuwahara)
 	{
 		FRDGTextureRef KuwaharaOutputTexture = GraphBuilder.CreateTexture(
 			OutputDesc,
 			TEXT("RDGPostProcess.KuwaharaOutput.PreTAA"));
-
-		AddCopyTexturePass(GraphBuilder, ChainedColorTexture, KuwaharaOutputTexture);
 
 		FKuwaharaPassParameters* KuwaharaParameters = GraphBuilder.AllocParameters<FKuwaharaPassParameters>();
 		KuwaharaParameters->Radius = static_cast<uint32>(FMath::RoundToInt(FMath::Max(Settings.Radius, 0.0f)));
@@ -302,44 +386,47 @@ FRDGTextureRef AddPostProcessChainForView(
 		ChainedColorTexture = KuwaharaOutputTexture;
 	}
 
-	if (Settings.bOutlineEnabled)
+	if (bShouldRunNPRFinalPass)
 	{
-		FRDGTextureRef OutlineOutputTexture = GraphBuilder.CreateTexture(
+		FRDGTextureRef NPRFinalOutputTexture = GraphBuilder.CreateTexture(
 			OutputDesc,
-			TEXT("RDGPostProcess.OutlineOutput.PreTAA"));
+			TEXT("RDGPostProcess.NPRFinalOutput.PreTAA"));
 
-		AddCopyTexturePass(GraphBuilder, ChainedColorTexture, OutlineOutputTexture);
-
-		FPostProcessPassParameters* OutlineParameters = GraphBuilder.AllocParameters<FPostProcessPassParameters>();
-		OutlineParameters->View = View.ViewUniformBuffer;
-		OutlineParameters->ViewRectMin = ViewRect.Min;
-		OutlineParameters->ViewRectSize = ViewRectSize;
-		OutlineParameters->OutlineColor = FVector4f(Settings.OutlineSettings.OutlineColor);
-		OutlineParameters->EdgeThreshold = Settings.OutlineSettings.EdgeThreshold;
-		OutlineParameters->Softness = Settings.OutlineSettings.Softness;
-		OutlineParameters->GlowIntensity = Settings.OutlineSettings.GlowIntensity;
-		OutlineParameters->PulseSpeed = Settings.OutlineSettings.PulseSpeed;
-		OutlineParameters->InputTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(ChainedColorTexture));
-		OutlineParameters->SceneDepthTexture = GraphBuilder.CreateSRV(
+		FNPRFinalPassParameters* NPRFinalParameters = GraphBuilder.AllocParameters<FNPRFinalPassParameters>();
+		NPRFinalParameters->View = View.ViewUniformBuffer;
+		NPRFinalParameters->ViewRectMin = ViewRect.Min;
+		NPRFinalParameters->ViewRectSize = ViewRectSize;
+		NPRFinalParameters->OutlineIntensity = Settings.bOutlineEnabled ? 1.0f : 0.0f;
+		NPRFinalParameters->OutlineColor = FVector4f(Settings.OutlineSettings.OutlineColor);
+		NPRFinalParameters->EdgeThreshold = Settings.OutlineSettings.EdgeThreshold;
+		NPRFinalParameters->Softness = Settings.OutlineSettings.Softness;
+		NPRFinalParameters->GlowIntensity = Settings.OutlineSettings.GlowIntensity;
+		NPRFinalParameters->PulseSpeed = Settings.OutlineSettings.PulseSpeed;
+		NPRFinalParameters->GlitchIntensity = Settings.bGlitchEnabled ? Settings.OutlineSettings.GlitchIntensity : 0.0f;
+		NPRFinalParameters->RGBShiftAmount = Settings.OutlineSettings.RGBShiftAmount;
+		NPRFinalParameters->BlockSliceAmount = Settings.OutlineSettings.BlockSliceAmount;
+		NPRFinalParameters->StaticNoiseLevel = Settings.OutlineSettings.StaticNoiseLevel;
+		NPRFinalParameters->InputTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(ChainedColorTexture));
+		NPRFinalParameters->SceneDepthTexture = GraphBuilder.CreateSRV(
 			FRDGTextureSRVDesc::CreateForMetaData(SceneDepthTexture, ERDGTextureMetaDataAccess::Depth));
-		OutlineParameters->SceneNormalTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneNormalTexture));
-		OutlineParameters->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		OutlineParameters->SceneDepthSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		OutlineParameters->SceneNormalSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		OutlineParameters->OutputTexture = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(OutlineOutputTexture));
+		NPRFinalParameters->SceneNormalTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneNormalTexture));
+		NPRFinalParameters->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		NPRFinalParameters->SceneDepthSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		NPRFinalParameters->SceneNormalSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		NPRFinalParameters->OutputTexture = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(NPRFinalOutputTexture));
 
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
-			RDG_EVENT_NAME("RDGPostProcess::OutlineCompositePreTAA"),
-			OutlineShader,
-			OutlineParameters,
+			RDG_EVENT_NAME("RDGPostProcess::NPRFinalPassPreTAA"),
+			NPRFinalShader,
+			NPRFinalParameters,
 			FComputeShaderUtils::GetGroupCount(
 				ViewRectSize,
 				FIntPoint(
-					FRDGPostProcessOutlineCS::ThreadGroupSize,
-					FRDGPostProcessOutlineCS::ThreadGroupSize)));
+					FRDGPostProcessNPRFinalCS::ThreadGroupSize,
+					FRDGPostProcessNPRFinalCS::ThreadGroupSize)));
 
-		ChainedColorTexture = OutlineOutputTexture;
+		ChainedColorTexture = NPRFinalOutputTexture;
 	}
 
 	if (ChainedColorTexture != SceneColorTexture)
@@ -402,7 +489,7 @@ void FRDGPostProcessSceneViewExtension::PrePostProcessPass_RenderThread(
 	const FPostProcessingInputs& Inputs)
 {
 	const FRDGResolvedPostProcessSettings Settings = RenderThreadSettings;
-	if (!Settings.bEnabled && !Settings.bOutlineEnabled)
+	if (!Settings.bEnabled && !HasNPRFinalPass(Settings))
 	{
 		return;
 	}
@@ -415,7 +502,7 @@ void FRDGPostProcessSceneViewExtension::PrePostProcessPass_RenderThread(
 		SceneNormalTexture = GSystemTextures.GetBlackDummy(GraphBuilder);
 	}
 
-	AddPostProcessChainForView(
+	AddMergedPostProcessChainForView(
 		GraphBuilder,
 		static_cast<const FViewInfo&>(View),
 		SceneColorTexture,

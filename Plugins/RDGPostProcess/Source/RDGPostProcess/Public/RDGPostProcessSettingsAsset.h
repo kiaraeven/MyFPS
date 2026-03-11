@@ -24,6 +24,18 @@ struct RDGPOSTPROCESS_API FOutlineSettings
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "16.0"))
 	float PulseSpeed = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float GlitchIntensity = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "12.0"))
+	float RGBShiftAmount = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float BlockSliceAmount = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float StaticNoiseLevel = 0.0f;
 };
 
 UCLASS(BlueprintType)
@@ -40,6 +52,9 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline")
 	bool bEnableOutline = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch")
+	bool bEnableGlitch = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline", meta = (ShowOnlyInnerProperties))
 	FOutlineSettings OutlineSettings;

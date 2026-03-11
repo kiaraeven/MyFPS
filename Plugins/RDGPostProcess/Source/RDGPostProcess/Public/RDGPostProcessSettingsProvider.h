@@ -14,6 +14,7 @@ struct FRDGResolvedPostProcessSettings
 	bool bEnabled = false;
 	float Radius = 0.0f;
 	bool bOutlineEnabled = false;
+	bool bGlitchEnabled = false;
 	FOutlineSettings OutlineSettings;
 };
 
@@ -39,6 +40,9 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline")
 	bool bEnableOutline = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Glitch")
+	bool bEnableGlitch = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "RDG Post Process|Outline", meta = (ShowOnlyInnerProperties))
 	FOutlineSettings OutlineSettings;

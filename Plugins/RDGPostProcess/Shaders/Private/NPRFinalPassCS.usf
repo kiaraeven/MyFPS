@@ -1,0 +1,358 @@
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/RDGPostProcess/Private/RDGPostProcess.usf"
+
+struct FNPRFinalSettings
+{
+	float OutlineIntensity;
+	float4 OutlineColor;
+	float EdgeThreshold;
+	float Softness;
+	float GlowIntensity;
+	float PulseSpeed;
+	float GlitchIntensity;
+	float RGBShiftAmount;
+	float BlockSliceAmount;
+	float StaticNoiseLevel;
+};
+
+float OutlineIntensity;
+float4 OutlineColor;
+float EdgeThreshold;
+float Softness;
+float GlowIntensity;
+float PulseSpeed;
+float GlitchIntensity;
+float RGBShiftAmount;
+float BlockSliceAmount;
+float StaticNoiseLevel;
+int2 ViewRectMin;
+int2 ViewRectSize;
+Texture2D<float4> InputTexture;
+Texture2D<float> SceneDepthTexture;
+Texture2D<float4> SceneNormalTexture;
+SamplerState InputSampler;
+SamplerState SceneDepthSampler;
+SamplerState SceneNormalSampler;
+RWTexture2D<float4> OutputTexture;
+
+FNPRFinalSettings MakeSettings()
+{
+	FNPRFinalSettings Settings;
+	Settings.OutlineIntensity = saturate(OutlineIntensity);
+	Settings.OutlineColor = OutlineColor;
+	Settings.EdgeThreshold = max(EdgeThreshold, 1e-4f);
+	Settings.Softness = saturate(Softness);
+	Settings.GlowIntensity = max(GlowIntensity, 0.0f);
+	Settings.PulseSpeed = max(PulseSpeed, 0.0f);
+	Settings.GlitchIntensity = saturate(GlitchIntensity);
+	Settings.RGBShiftAmount = max(RGBShiftAmount, 0.0f);
+	Settings.BlockSliceAmount = saturate(BlockSliceAmount);
+	Settings.StaticNoiseLevel = saturate(StaticNoiseLevel);
+	return Settings;
+}
+
+float2 GetViewRectBufferUVMin()
+{
+	const float2 BufferUVMin = (float2(ViewRectMin.x, ViewRectMin.y) + 0.5f) * View.BufferSizeAndInvSize.zw;
+	return max(BufferUVMin, ResolvedView.BufferBilinearUVMinMax.xy);
+}
+
+float2 GetViewRectBufferUVMax()
+{
+	const int2 ViewRectMaxPixel = ViewRectMin + ViewRectSize - 1;
+	const float2 BufferUVMax = (float2(ViewRectMaxPixel.x, ViewRectMaxPixel.y) + 0.5f) * View.BufferSizeAndInvSize.zw;
+	return min(BufferUVMax, ResolvedView.BufferBilinearUVMinMax.zw);
+}
+
+float2 ClampSceneBufferUV(float2 BufferUV)
+{
+	return clamp(BufferUV, GetViewRectBufferUVMin(), GetViewRectBufferUVMax());
+}
+
+float2 GetJitterViewportOffset()
+{
+	return ScreenPosToViewportUV(ResolvedView.TemporalAAJitter.xy) - float2(0.5f, 0.5f);
+}
+
+float2 MakeStableBufferUV(float2 BufferUV)
+{
+	const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 UnjitteredViewportUV = ViewportUV - GetJitterViewportOffset();
+	return ClampSceneBufferUV(ViewportUVToBufferUV(UnjitteredViewportUV));
+}
+
+float4 SampleInputColor(float2 BufferUV)
+{
+	return Texture2DSampleLevel(InputTexture, InputSampler, ClampSceneBufferUV(BufferUV), 0);
+}
+
+float LoadLinearSceneDepth(float2 BufferUV)
+{
+	const float DeviceDepth = SceneDepthTexture.SampleLevel(SceneDepthSampler, ClampSceneBufferUV(BufferUV), 0);
+	return ConvertFromDeviceZ(DeviceDepth);
+}
+
+float3 LoadSceneNormal(float2 BufferUV)
+{
+	float3 EncodedNormal = Texture2DSampleLevel(SceneNormalTexture, SceneNormalSampler, ClampSceneBufferUV(BufferUV), 0).xyz * 2.0f - 1.0f;
+	const float LengthSq = dot(EncodedNormal, EncodedNormal);
+	if (LengthSq <= 1e-4f)
+	{
+		return float3(0.0f, 0.0f, 1.0f);
+	}
+
+	return normalize(EncodedNormal);
+}
+
+float Hash12(float2 P)
+{
+	float3 P3 = frac(float3(P.xyx) * 0.1031f);
+	P3 += dot(P3, P3.yzx + 33.33f);
+	return frac((P3.x + P3.y) * P3.z);
+}
+
+float3 Hash33(float3 P3)
+{
+	P3 = frac(P3 * float3(0.1031f, 0.1030f, 0.0973f));
+	P3 += dot(P3, P3.yxz + 33.33f);
+	return frac((P3.xxy + P3.yzz) * P3.zyx);
+}
+
+float SampleKernelWeight(int2 Offset)
+{
+	return all(abs(Offset) == int2(1, 1)) ? 1.0f : 2.0f;
+}
+
+float ComputeSoftEdgeWeight(float Difference, float Threshold, float SoftnessFactor)
+{
+	const float SoftRange = max(max(Threshold, 1e-4f) * max(SoftnessFactor, 0.0f), 1e-4f);
+	return smoothstep(max(Threshold - SoftRange, 0.0f), Threshold + SoftRange, Difference);
+}
+
+float ComputeDepthEdgeMetric(float2 BufferUV, float2 TexelSize)
+{
+	const float CenterDepth = LoadLinearSceneDepth(BufferUV);
+	float WeightedDifference = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -1; SampleY <= 1; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -1; SampleX <= 1; ++SampleX)
+		{
+			const int2 Offset = int2(SampleX, SampleY);
+			if (all(Offset == int2(0, 0)))
+			{
+				continue;
+			}
+
+			const float Weight = SampleKernelWeight(Offset);
+			const float NeighborDepth = LoadLinearSceneDepth(BufferUV + float2(Offset) * TexelSize);
+			const float RelativeDifference = abs(NeighborDepth - CenterDepth) / max(max(CenterDepth, NeighborDepth), 1.0f);
+			WeightedDifference += RelativeDifference * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? WeightedDifference / WeightSum : 0.0f;
+}
+
+float ComputeNormalEdgeMetric(float2 BufferUV, float2 TexelSize)
+{
+	const float3 CenterNormal = LoadSceneNormal(BufferUV);
+	float WeightedDifference = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -1; SampleY <= 1; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -1; SampleX <= 1; ++SampleX)
+		{
+			const int2 Offset = int2(SampleX, SampleY);
+			if (all(Offset == int2(0, 0)))
+			{
+				continue;
+			}
+
+			const float Weight = SampleKernelWeight(Offset);
+			const float3 NeighborNormal = LoadSceneNormal(BufferUV + float2(Offset) * TexelSize);
+			WeightedDifference += length(NeighborNormal - CenterNormal) * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? WeightedDifference / WeightSum : 0.0f;
+}
+
+float ComputeEdgeStrength(float2 BufferUV, float2 TexelSize, FNPRFinalSettings Settings)
+{
+	const float DepthMetric = ComputeDepthEdgeMetric(BufferUV, TexelSize);
+	const float NormalMetric = ComputeNormalEdgeMetric(BufferUV, TexelSize);
+	const float DepthEdge = ComputeSoftEdgeWeight(DepthMetric, Settings.EdgeThreshold, Settings.Softness);
+	const float NormalThreshold = max(Settings.EdgeThreshold * 1.75f, 0.04f);
+	const float NormalEdge = ComputeSoftEdgeWeight(NormalMetric * 0.5f, NormalThreshold, max(Settings.Softness * 0.75f, 0.05f));
+	return saturate(max(DepthEdge, NormalEdge * 0.65f));
+}
+
+float ComputeGlowScatter(float2 BufferUV, float2 TexelSize, FNPRFinalSettings Settings)
+{
+	float Glow = 0.0f;
+	float WeightSum = 0.0f;
+
+	[unroll]
+	for (int SampleY = -2; SampleY <= 2; ++SampleY)
+	{
+		[unroll]
+		for (int SampleX = -2; SampleX <= 2; ++SampleX)
+		{
+			const float DistanceSq = float(SampleX * SampleX + SampleY * SampleY);
+			if (DistanceSq > 4.0f)
+			{
+				continue;
+			}
+
+			const float Weight = 1.0f / (1.0f + DistanceSq);
+			const float SampleEdgeStrength = ComputeEdgeStrength(BufferUV + float2(SampleX, SampleY) * TexelSize, TexelSize, Settings);
+			Glow += SampleEdgeStrength * Weight;
+			WeightSum += Weight;
+		}
+	}
+
+	return WeightSum > 0.0f ? Glow / WeightSum : 0.0f;
+}
+
+float ComputePulse(FNPRFinalSettings Settings)
+{
+	return Settings.PulseSpeed > 0.0f
+		? (0.55f + 0.45f * (0.5f + 0.5f * sin(ResolvedView.GameTime * Settings.PulseSpeed)))
+		: 1.0f;
+}
+
+float2 ComputeSliceBufferUV(
+	float2 BaseBufferUV,
+	float2 StableViewportUV,
+	float2 TexelSize,
+	FNPRFinalSettings Settings,
+	out float SliceWeight)
+{
+	const float GlitchStrength = Settings.GlitchIntensity;
+	const float StripCount = lerp(18.0f, 84.0f, Settings.BlockSliceAmount);
+	const float StripIndex = floor(StableViewportUV.y * StripCount);
+	const float TimePhase = floor(ResolvedView.GameTime * lerp(10.0f, 24.0f, GlitchStrength));
+	const float SliceMask = smoothstep(
+		0.52f,
+		0.94f,
+		Hash12(float2(StripIndex + 3.1f, TimePhase + 11.7f)));
+	const float OffsetDirection = Hash12(float2(StripIndex + 23.9f, TimePhase * 1.37f)) * 2.0f - 1.0f;
+	const float OffsetPixels = OffsetDirection * (2.0f + 18.0f * Settings.BlockSliceAmount) * GlitchStrength;
+	SliceWeight = SliceMask * Settings.BlockSliceAmount * GlitchStrength;
+	return ClampSceneBufferUV(BaseBufferUV + float2(OffsetPixels * TexelSize.x, 0.0f));
+}
+
+float3 ApplyGlitch(
+	float3 OutlinedColor,
+	float2 BaseBufferUV,
+	float2 StableBufferUV,
+	float2 TexelSize,
+	float OutlineBlendAlpha,
+	float3 LaserColor,
+	FNPRFinalSettings Settings)
+{
+	const float GlitchStrength = Settings.GlitchIntensity;
+	if (GlitchStrength <= 1e-4f)
+	{
+		return OutlinedColor;
+	}
+
+	const float2 StableViewportUV = saturate(BufferUVToViewportUV(StableBufferUV));
+	float SliceWeight = 0.0f;
+	const float2 SliceBufferUV = ComputeSliceBufferUV(BaseBufferUV, StableViewportUV, TexelSize, Settings, SliceWeight);
+	float3 FinalColor = OutlinedColor;
+
+	if (SliceWeight > 0.0f)
+	{
+		const float3 SliceBaseColor = SampleInputColor(SliceBufferUV).rgb;
+		const float3 SliceOutlinedColor = lerp(SliceBaseColor, LaserColor, OutlineBlendAlpha);
+		FinalColor = lerp(FinalColor, SliceOutlinedColor, SliceWeight);
+	}
+
+	const float ShiftStrength = saturate(Settings.RGBShiftAmount / 8.0f) * GlitchStrength;
+	if (ShiftStrength > 0.0f)
+	{
+		const float ShiftFlicker = 0.35f + 0.65f * Hash12(
+			float2(floor(ResolvedView.GameTime * 18.0f), floor(StableViewportUV.y * 96.0f) + 7.0f));
+		const float ShiftPixels = Settings.RGBShiftAmount * ShiftFlicker * (0.75f + 0.25f * SliceWeight);
+		const float2 ShiftOffset = float2(ShiftPixels * TexelSize.x, 0.0f);
+		const float3 PositiveShiftBase = SampleInputColor(SliceBufferUV + ShiftOffset).rgb;
+		const float3 NegativeShiftBase = SampleInputColor(SliceBufferUV - ShiftOffset).rgb;
+		float3 ChromaColor = float3(PositiveShiftBase.r, FinalColor.g, NegativeShiftBase.b);
+		ChromaColor = lerp(ChromaColor, LaserColor, OutlineBlendAlpha * 0.7f);
+		FinalColor = lerp(FinalColor, ChromaColor, ShiftStrength * (0.65f + 0.35f * SliceWeight));
+	}
+
+	const float NoiseStrength = Settings.StaticNoiseLevel * GlitchStrength;
+	if (NoiseStrength > 0.0f)
+	{
+		const float2 ViewRectPixelSize = max(float2(ViewRectSize.x, ViewRectSize.y), float2(1.0f, 1.0f));
+		const float2 NoiseGrid = floor(StableViewportUV * ViewRectPixelSize * 0.5f);
+		const float NoisePhase = floor(ResolvedView.GameTime * lerp(18.0f, 42.0f, GlitchStrength));
+		const float3 Noise = Hash33(float3(NoiseGrid, NoisePhase)) * 2.0f - 1.0f;
+		const float LineMask = 0.6f + 0.4f * Hash12(float2(NoiseGrid.y + NoisePhase, NoiseGrid.x + 3.0f));
+		FinalColor += Noise * (NoiseStrength * 0.18f * LineMask);
+	}
+
+	return saturate(FinalColor);
+}
+
+[numthreads(32, 32, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	ResolvedView = ResolveView();
+
+	uint Width;
+	uint Height;
+	OutputTexture.GetDimensions(Width, Height);
+
+	if (DispatchThreadId.x >= Width || DispatchThreadId.y >= Height)
+	{
+		return;
+	}
+
+	if (DispatchThreadId.x >= ViewRectSize.x || DispatchThreadId.y >= ViewRectSize.y)
+	{
+		return;
+	}
+
+	const int2 Pixel = ViewRectMin + int2(DispatchThreadId.xy);
+	const FNPRFinalSettings Settings = MakeSettings();
+	const float2 PixelPosition = float2(Pixel) + 0.5f;
+	const float2 TexelSize = View.BufferSizeAndInvSize.zw;
+	const float2 PixelBufferUV = ClampSceneBufferUV(PixelPosition * TexelSize);
+	const float2 StableBufferUV = MakeStableBufferUV(PixelBufferUV);
+	const float4 BaseColor = SampleInputColor(PixelBufferUV);
+
+	const float CoreEdgeStrength = Settings.OutlineIntensity > 0.0f
+		? ComputeEdgeStrength(StableBufferUV, TexelSize, Settings)
+		: 0.0f;
+	const float GlowScatter = Settings.OutlineIntensity > 0.0f
+		? ComputeGlowScatter(StableBufferUV, TexelSize, Settings)
+		: 0.0f;
+	const float Pulse = ComputePulse(Settings);
+	const float GlowEdgeStrength = saturate(max(CoreEdgeStrength, GlowScatter * 0.9f));
+	const float OutlineBlendAlpha = saturate(Settings.OutlineIntensity * Settings.OutlineColor.a * GlowEdgeStrength * Pulse);
+	const float3 LaserColor = Settings.OutlineColor.rgb * Settings.GlowIntensity * lerp(0.9f, 1.25f, Pulse);
+	float3 FinalColor = lerp(BaseColor.rgb, LaserColor, OutlineBlendAlpha);
+
+	FinalColor = ApplyGlitch(
+		FinalColor,
+		PixelBufferUV,
+		StableBufferUV,
+		TexelSize,
+		OutlineBlendAlpha,
+		LaserColor,
+		Settings);
+
+	OutputTexture[Pixel] = float4(FinalColor, BaseColor.a);
+}
